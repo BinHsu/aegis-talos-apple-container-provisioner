@@ -1,0 +1,16 @@
+# OS / editor noise
+.DS_Store
+**/.obsidian/
+.idea/
+.vscode/
+*.swp
+
+# Go
+bin/
+*.test
+*.out
+vendor/
+
+# local experiment artifacts
+_out/
+*.log

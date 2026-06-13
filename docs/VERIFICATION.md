@@ -156,5 +156,27 @@ observed. Empty-but-claimed verification is the exact failure this spike is buil
   mechanical copy (the delta is preserved under `upstream/`). The provider needed zero framework
   changes. → remaining: CI gates.
 
+## 2026-06-13 — G5/stress: robustness suite ✅ PASS (Claude-run, pending final acceptance)
+- **Ran:** via the real `talosctl cluster create apple-container` (exit 0 == full health passed):
+  T1 default memory (1cp+1worker @ the out-of-box 2GiB); T2 multi-node (1cp + 2 workers); T3
+  idempotency (same cluster name create→destroy ×2). Clean-check after each.
+- **Expected:** confirm the everyday paths I had NOT verified — default memory, >2 nodes, repeated
+  lifecycles — work without leaks.
+- **Saw:**
+  - **T1 PASS** — the default 2GiB control-plane is sufficient; apiserver does not OOM. (The G4
+    boundary was 1GB-fails / 4GB-works; 2GiB also works, so 4GiB was overkill.)
+  - **T2 PASS** — 3-node cluster reached full health; nodes got distinct IPs `.2/.3/.4`; clean teardown.
+  - **T3 PASS** — both create/destroy cycles healthy, state dir reused after teardown, zero leftover
+    containers/networks each time.
+  - Whole suite left `container ls -a` empty, only the default network, no state dirs.
+- **Surprised me:** the default 2GiB just works — I'd over-specced 4GiB from the G4 1GB-fail data
+  without testing the 2GiB middle. Also a test bug of mine: `--controlplanes` is **not** a flag on
+  the user-facing command (count is fixed at 1, same as docker/qemu — multi-cp is the `dev`
+  subcommand's feature); the provider's node loop supports N control-plane, just not exposed here.
+- **Verdict:** robust for everyday single-control-plane use (default mem, multi-worker, repeated
+  lifecycles, no leaks). **Not yet stressed:** 3-control-plane etcd quorum via the real command (not
+  exposed by design; reachable through `cmd/aegis --controlplanes`), long-running stability,
+  concurrent clusters, cold-restart (the known dynamic-IP limitation).
+
 Fill each first-person as the gate runs. Surprises and dead-ends are the most valuable
 entries — they are what a reviewer reads as a human having actually done the work.

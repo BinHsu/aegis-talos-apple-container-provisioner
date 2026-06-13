@@ -1,0 +1,186 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+// Command aegis is a thin driver that provisions a Talos cluster on Apple's `container`
+// runtime via the apple provider. It exists because choice A keeps the provider as an
+// out-of-tree module (we do not fork talosctl), so we cannot register a `talosctl cluster
+// create apple` subcommand to run it.
+//
+// It deliberately mirrors what `talosctl cluster create` does in-process — build the config
+// bundle through the provider's GenOptions, then call provision.Provisioner.Create — so it is
+// the direct precursor of the eventual upstream cmd_apple.go. Bootstrap / health / kubeconfig
+// are left to the operator (as talosctl's postCreate does), and printed as next steps.
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"log"
+	"net/netip"
+	"path/filepath"
+	"strings"
+
+	"github.com/siderolabs/talos/pkg/machinery/config"
+	"github.com/siderolabs/talos/pkg/machinery/config/bundle"
+	"github.com/siderolabs/talos/pkg/machinery/config/generate"
+	"github.com/siderolabs/talos/pkg/machinery/config/machine"
+	"github.com/siderolabs/talos/pkg/machinery/constants"
+	"github.com/siderolabs/talos/pkg/provision"
+
+	"github.com/BinHsu/aegis-talos-apple-container-provisioner/provider/apple"
+)
+
+const mib = 1024 * 1024
+
+func main() {
+	if err := run(); err != nil {
+		log.Fatalf("aegis: %v", err)
+	}
+}
+
+func run() error {
+	var (
+		clusterName = flag.String("name", "aegis", "cluster name")
+		talosImage  = flag.String("image", "ghcr.io/siderolabs/talos:v1.13.3", "Talos node image")
+		kubeVersion = flag.String("kube-version", "", "Kubernetes version (empty = Talos default)")
+		stateDir    = flag.String("state-dir", "_out/clusters", "cluster state directory")
+		subnet      = flag.String("subnet", "192.168.64.0/24", "vmnet subnet (informational; DHCP assigns IPs)")
+		cpMemMB     = flag.Int64("cp-memory", 4096, "control-plane memory (MB); >= ~2GB required")
+		workerMemMB = flag.Int64("worker-memory", 2048, "worker memory (MB)")
+		cpCount     = flag.Int("controlplanes", 1, "number of control-plane nodes")
+		workerCount = flag.Int("workers", 1, "number of worker nodes")
+	)
+
+	flag.Parse()
+
+	ctx := context.Background()
+
+	prov, err := apple.NewProvisioner(ctx)
+	if err != nil {
+		return err
+	}
+
+	defer prov.Close() //nolint:errcheck
+
+	// Talos version contract derived from the image tag (e.g. ...:v1.13.3 -> v1.13.3).
+	talosVersion := *talosImage
+	if i := strings.LastIndex(talosVersion, ":"); i != -1 {
+		talosVersion = talosVersion[i+1:]
+	}
+
+	versionContract, err := config.ParseContractFromVersion(talosVersion)
+	if err != nil {
+		return fmt.Errorf("parsing Talos version %q: %w", talosVersion, err)
+	}
+
+	cidr, err := netip.ParsePrefix(*subnet)
+	if err != nil {
+		return fmt.Errorf("parsing subnet: %w", err)
+	}
+
+	// vmnet gateway is the first address in the subnet (verified G4: 192.168.64.1).
+	gateway := cidr.Addr().Next()
+
+	networkReq := provision.NetworkRequest{
+		Name:         "default", // built-in vmnet network; ensureNetwork uses it as-is
+		CIDRs:        []netip.Prefix{cidr},
+		GatewayAddrs: []netip.Addr{gateway},
+		MTU:          1500,
+	}
+
+	// Build the config bundle the same way talosctl cluster create does: ask the provider for its
+	// gen/bundle options (this is what exercises apple.GenOptions), then add the input options.
+	inClusterEndpoint := prov.GetInClusterKubernetesControlPlaneEndpoint(networkReq, constants.DefaultControlPlanePort)
+
+	genOpts, bundleOpts := prov.GenOptions(networkReq, versionContract)
+	genOpts = append(genOpts,
+		generate.WithVersionContract(versionContract),
+		generate.WithEndpointList(prov.GetTalosAPIEndpoints(networkReq)),
+	)
+
+	bundleOpts = append(bundleOpts, bundle.WithInputOptions(&bundle.InputOptions{
+		ClusterName: *clusterName,
+		Endpoint:    inClusterEndpoint,
+		KubeVersion: strings.TrimPrefix(*kubeVersion, "v"),
+		GenOptions:  genOpts,
+	}))
+
+	configBundle, err := bundle.NewBundle(bundleOpts...)
+	if err != nil {
+		return fmt.Errorf("generating config bundle: %w", err)
+	}
+
+	nodes := make([]provision.NodeRequest, 0, *cpCount+*workerCount)
+
+	for i := range *cpCount {
+		nodes = append(nodes, provision.NodeRequest{
+			Name:     fmt.Sprintf("%s-controlplane-%d", *clusterName, i+1),
+			Type:     machine.TypeControlPlane,
+			Config:   configBundle.ControlPlane(),
+			Memory:   *cpMemMB * mib,
+			NanoCPUs: 2e9,
+		})
+	}
+
+	for i := range *workerCount {
+		nodes = append(nodes, provision.NodeRequest{
+			Name:     fmt.Sprintf("%s-worker-%d", *clusterName, i+1),
+			Type:     machine.TypeWorker,
+			Config:   configBundle.Worker(),
+			Memory:   *workerMemMB * mib,
+			NanoCPUs: 2e9,
+		})
+	}
+
+	clusterReq := provision.ClusterRequest{
+		Name:           *clusterName,
+		Network:        networkReq,
+		Nodes:          nodes,
+		Image:          *talosImage,
+		StateDirectory: *stateDir,
+		SelfExecutable: "talosctl", // apply-config is run via talosctl (see reconcile.go)
+	}
+
+	cluster, err := prov.Create(ctx, clusterReq, provision.WithTalosConfig(configBundle.TalosConfig()))
+	if err != nil {
+		return err
+	}
+
+	// Write the cluster's talosconfig so the operator can drive bootstrap/health.
+	talosconfigPath := filepath.Join(*stateDir, *clusterName, "talosconfig")
+	if err = configBundle.TalosConfig().Save(talosconfigPath); err != nil {
+		return fmt.Errorf("saving talosconfig: %w", err)
+	}
+
+	info := cluster.Info()
+
+	fmt.Println("\n=== cluster provisioned ===")
+
+	var cpIP string
+
+	for _, n := range info.Nodes {
+		role := "worker"
+		if n.Type == machine.TypeControlPlane || n.Type == machine.TypeInit {
+			role = "controlplane"
+			if cpIP == "" && len(n.IPs) > 0 {
+				cpIP = n.IPs[0].String()
+			}
+		}
+
+		if len(n.IPs) > 0 {
+			fmt.Printf("  %-28s %-12s %s\n", n.Name, role, n.IPs[0])
+		}
+	}
+
+	fmt.Printf("\ntalosconfig: %s\n", talosconfigPath)
+	fmt.Println("\nnext steps (operator):")
+	fmt.Printf("  export TALOSCONFIG=%s\n", talosconfigPath)
+	fmt.Printf("  talosctl config endpoint %s && talosctl config node %s\n", cpIP, cpIP)
+	fmt.Printf("  talosctl bootstrap\n")
+	fmt.Printf("  talosctl health\n")
+	fmt.Printf("  talosctl kubeconfig ./kubeconfig && KUBECONFIG=./kubeconfig kubectl get nodes\n")
+
+	return nil
+}

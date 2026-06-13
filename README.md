@@ -2,11 +2,11 @@
 
 Spike toward an upstream `talosctl` provisioner that runs local Talos Linux clusters on Apple's [`container`](https://github.com/apple/container) runtime (macOS 26+, Apple Silicon, one micro-VM per container).
 
-> **Status: exploration, not maintained tooling.** This repo exists to answer one question — *can `talosctl cluster create` work on macOS without a Docker API?* — in the shape an upstream contribution would take ([siderolabs/talos#10537](https://github.com/siderolabs/talos/issues/10537)). Conclusions land in a blog post; the code here is the receipts. If the experiment proves out and upstream signals interest, this moves into `siderolabs/talos` as a `pkg/provision` provider and this repo gets archived. Do not build on it.
+> **Status: exploration, not maintained tooling.** This repo exists to answer one question — *can `talosctl cluster create` work on macOS without a Docker API?* — in the shape an upstream contribution would take (following the macOS qemu provider precedent, [siderolabs/talos#10537](https://github.com/siderolabs/talos/issues/10537), shipped 2025). Conclusions land in a blog post; the code here is the receipts. If the experiment proves out and upstream signals interest, this moves into `siderolabs/talos` as a `pkg/provision` provider and this repo gets archived. Do not build on it.
 
 ## Why
 
-Talos's local-dev path on macOS hard-depends on the Docker Engine API (`talosctl cluster create --provisioner docker`). That dependency is thinner than it looks:
+Talos's documented local-dev quickstart on macOS routes through the Docker Engine API (`talosctl cluster create --provisioner docker`). A qemu provisioner also landed for macOS in 2025 ([PR #11110](https://github.com/siderolabs/talos/pull/11110)) but carries open networking bugs ([#12727](https://github.com/siderolabs/talos/issues/12727), [#12834](https://github.com/siderolabs/talos/issues/12834)). The Docker dependency is still thinner than it looks:
 
 - The Talos node artifact is a standard OCI image (`ghcr.io/siderolabs/talos`).
 - The management plane (`talosctl gen config` / `apply-config` / `bootstrap`) talks the Talos gRPC API on port 50000 — no Docker anywhere.

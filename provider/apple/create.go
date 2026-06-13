@@ -23,6 +23,10 @@ import (
 // the DHCP reconciliation (see reconcileConfigs). `container run` pulls the image on demand,
 // so there is no explicit image-pull step.
 func (p *provisioner) Create(ctx context.Context, request provision.ClusterRequest, opts ...provision.Option) (provision.Cluster, error) {
+	if err := validateClusterRequest(request); err != nil {
+		return nil, err
+	}
+
 	options := provision.DefaultOptions()
 
 	for _, opt := range opts {
@@ -93,6 +97,19 @@ func (p *provisioner) Create(ctx context.Context, request provision.ClusterReque
 		clusterInfo: state.ClusterInfo,
 		statePath:   statePath,
 	}, nil
+}
+
+// validateClusterRequest rejects requests that would break provisioning, rather than failing
+// deep inside Create (e.g. a request with no control-plane node would otherwise panic when we
+// take the first node's IP as the cluster endpoint). A worker-only count is the meaningful
+// boundary: >= 1 control-plane is required; 0 workers (a single control-plane cluster) is valid.
+func validateClusterRequest(request provision.ClusterRequest) error {
+	if len(request.Nodes.ControlPlaneNodes()) == 0 {
+		return fmt.Errorf("cluster %q: at least one control-plane node is required, got %d nodes (%d control-plane)",
+			request.Name, len(request.Nodes), len(request.Nodes.ControlPlaneNodes()))
+	}
+
+	return nil
 }
 
 // assertDistinctIPs fails if any two nodes share an IP (an everyday-correctness regression guard).

@@ -17,7 +17,7 @@ AI-comprehensive-without-verification trap this spike explicitly avoids.
 | `talosctl` | v1.13.3 | gen-config / apply-config / bootstrap / health | G4+ |
 | Talos node image | `ghcr.io/siderolabs/talos:v1.13.3` | the node OS — pin to `talosctl` | G1+ |
 | `kubectl` | any recent | G4 acceptance — nodes `Ready` | G4 |
-| `go` | 1.26.3 | build the aegis provider | G5 |
+| `go` | 1.26.4 | build the aegis provider + talosctl (>= 1.26.4 closes GO-2026-5037/5039) | G5 |
 | `siderolabs/talos` Go module | matches v1.13.3 | compile against `pkg/provision` | G5 |
 | `golangci-lint` | bundles gocyclo/gocognit/cyclop/funlen/maintidx | provider lint + complexity/BVA gates | G5 |
 | `jq` | any | parse `container` / `talosctl` JSON | G3+ |
@@ -46,16 +46,17 @@ go version                                     # >= 1.26.4
 Build a talosctl that has the apple-container provider by applying this repo's delta to a Talos
 checkout (the files only compile inside the Talos tree — that's why they live under `upstream/`):
 ```bash
-git clone --branch v1.13.3 https://github.com/siderolabs/talos _out/talos-fork
-F=_out/talos-fork; C=$F/cmd/talosctl/cmd/mgmt/cluster/create
-cp -R provider/apple                                          $F/pkg/provision/providers/apple
-cp upstream/$C/cmd_apple.go upstream/$C/create_apple.go       $C/            2>/dev/null || \
-  { cp upstream/cmd/talosctl/cmd/mgmt/cluster/create/cmd_apple.go     $C/; \
-    cp upstream/cmd/talosctl/cmd/mgmt/cluster/create/create_apple.go  $C/; \
-    cp upstream/cmd/talosctl/cmd/mgmt/cluster/create/clusterops/apple.go            $C/clusterops/; \
-    cp upstream/cmd/talosctl/cmd/mgmt/cluster/create/clusterops/configmaker/apple.go $C/clusterops/configmaker/; \
-    cp upstream/cmd/talosctl/cmd/mgmt/cluster/create/clusterops/configmaker/internal/makers/apple.go $C/clusterops/configmaker/internal/makers/; }
-( cd $F && git apply ../../upstream/pkg/provision/providers/factory.go.diff && go build -o /tmp/talosctl-apple ./cmd/talosctl )
+git clone --depth 1 --branch v1.13.3 https://github.com/siderolabs/talos _out/talos-fork
+F=_out/talos-fork
+C=cmd/talosctl/cmd/mgmt/cluster/create          # same relative path under upstream/ and the fork
+cp -R provider/apple $F/pkg/provision/providers/apple
+cp upstream/$C/cmd_apple.go    $F/$C/
+cp upstream/$C/create_apple.go $F/$C/
+cp upstream/$C/clusterops/apple.go $F/$C/clusterops/
+cp upstream/$C/clusterops/configmaker/apple.go $F/$C/clusterops/configmaker/
+cp upstream/$C/clusterops/configmaker/internal/makers/apple.go $F/$C/clusterops/configmaker/internal/makers/
+( cd $F && git apply ../../upstream/pkg/provision/providers/factory.go.diff )
+( cd $F && go build -o /tmp/talosctl-apple ./cmd/talosctl )
 
 # out-of-box defaults: Talos v1.13.3 node image, default Kubernetes version, 2GiB control-plane
 /tmp/talosctl-apple cluster create apple-container --name demo
@@ -75,6 +76,9 @@ talosctl kubeconfig ./kubeconfig && export KUBECONFIG=$PWD/kubeconfig
 
 ### Verify — run a real workload (the canonical nginx)
 ```bash
+# NOTE: a leftover kubeconfig context from a previous run makes talosctl rename this one
+# (e.g. admin@demo -> admin@demo-1). Check `kubectl config current-context`; add --context <name>
+# to the kubectl commands below if it is not the current one.
 kubectl get nodes -o wide                       # both Ready: Talos (v1.13.3), kernel 6.18.15 (arm64)
 kubectl create deployment nginx --image=nginx   # PodSecurity 'restricted' warning is expected & harmless
 kubectl expose deployment nginx --port=80

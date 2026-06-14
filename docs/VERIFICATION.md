@@ -221,5 +221,21 @@ observed. Empty-but-claimed verification is the exact failure this spike is buil
 - **Verdict:** a genuinely usable Kubernetes cluster (real workload reachable in-cluster), not just
   nodes Ready. The runbook Tutorial is verified end to end — a forker can reproduce from zero.
 
+## 2026-06-14 — FINAL ACCEPTANCE: Bin ran the runbook Tutorial end to end ✅ **Bin-accepted**
+- **Who:** Bin, hands-on in his own terminal (NOT Claude-run) — the human-acceptance gate this whole
+  effort was built around (the "one final total sign-off" from the Execution & acceptance model above).
+- **Ran (verbatim from the runbook Tutorial, Path A, from a fresh checkout):** built `talosctl-apple`
+  from a clean talos v1.13.3 clone + this repo's delta; `talosctl cluster create apple-container
+  --name demo`; deployed the canonical nginx + Service; in-cluster curl; `cluster destroy`.
+- **Saw:** `apple-container` subcommand present; 2 nodes health-green; nginx 1/1 Running on the worker
+  (pod IP on the flannel net); in-cluster `curl http://nginx.default.svc.cluster.local` → **HTTP 200**;
+  teardown left `container ls -a` empty.
+- **Found + fixed during the run (the point of a real hands-on pass):** (1) the Path A `cp` block had
+  a `$C`-prefix bug that only worked via a fallback → rewritten to clean relative-path copies; (2) a
+  leftover kubeconfig context makes talosctl rename the new one (`admin@demo` → `admin@demo-1`) → noted
+  in the Verify step. Both folded back into `runbook.md`.
+- **Verdict:** **Bin-accepted 2026-06-14.** The provider, the upstream integration, and the forker
+  runbook are verified by the human, from zero, on a fresh checkout. The spike's acceptance gate is cleared.
+
 Fill each first-person as the gate runs. Surprises and dead-ends are the most valuable
 entries — they are what a reviewer reads as a human having actually done the work.

@@ -1,32 +1,44 @@
 # aegis-talos-apple-container-provisioner
 
-Spike toward an upstream `talosctl` provisioner that runs local Talos Linux clusters on Apple's [`container`](https://github.com/apple/container) runtime (macOS 26+, Apple Silicon, one micro-VM per container).
+A `talosctl` provisioner that runs local Talos Linux clusters on Apple's [`container`](https://github.com/apple/container) runtime (macOS 26+, Apple Silicon) — one micro-VM per node, no Docker daemon anywhere in the stack.
 
-> **Status: exploration, not maintained tooling.** This repo exists to answer one question — *can `talosctl cluster create` work on macOS without a Docker API?* — in the shape an upstream contribution would take (following the macOS qemu provider precedent, [siderolabs/talos#10537](https://github.com/siderolabs/talos/issues/10537), shipped 2025). Conclusions land in a blog post; the code here is the receipts. If the experiment proves out and upstream signals interest, this moves into `siderolabs/talos` as a `pkg/provision` provider and this repo gets archived. Do not build on it.
+> **Status: a proven spike, not maintained tooling.** It answers one question — *can `talosctl cluster create` run a real Talos cluster on macOS with no Docker API?* — and the answer is yes, verified end to end (see [`docs/runbook.md`](docs/runbook.md) and [`docs/VERIFICATION.md`](docs/VERIFICATION.md)). It was pitched upstream and **declined on principled grounds** — see [siderolabs/talos#13587](https://github.com/siderolabs/talos/discussions/13587). It stays here as a standalone dev/CI substrate. The conclusions live in a blog post; the code is the receipts. Do not build production on it.
 
 ## Why
 
-Talos's documented local-dev quickstart on macOS routes through the Docker Engine API (`talosctl cluster create --provisioner docker`). A qemu provisioner also landed for macOS in 2025 ([PR #11110](https://github.com/siderolabs/talos/pull/11110)) but carries open networking bugs ([#12727](https://github.com/siderolabs/talos/issues/12727), [#12834](https://github.com/siderolabs/talos/issues/12834)). The Docker dependency is still thinner than it looks:
+Production Kubernetes shed the Docker daemon years ago — `dockershim` is gone, the runtime underneath is containerd or CRI-O, and Talos itself ships no Docker. But the local dev loop never followed: `kind`, `minikube`, and Talos's own `docker` provisioner all still ride a Docker daemon behind Docker Desktop or OrbStack.
+
+Apple's `container` (1.0.0, June 2026) runs OCI images as per-node micro-VMs and speaks no Docker API at all. The Docker dependency in local Talos is thinner than it looks:
 
 - The Talos node artifact is a standard OCI image (`ghcr.io/siderolabs/talos`).
 - The management plane (`talosctl gen config` / `apply-config` / `bootstrap`) talks the Talos gRPC API on port 50000 — no Docker anywhere.
-- Only the local provisioner — create a network, start node containers — touches the Docker API.
+- Only the local provisioner — create a network, start node containers — touches a container runtime.
 
-Apple's `container` (1.0.0, June 2026) runs OCI images as micro-VMs with a per-container kernel, but exposes no Docker API. The hypothesis: a provisioner that execs the `container` CLI — the same pattern the in-tree QEMU provisioner uses with `qemu` — closes the gap, and replaces Docker mode's shared-kernel containers with VM-isolated nodes.
+So a provisioner that execs the `container` CLI — the same pattern the in-tree QEMU provisioner uses with `qemu` — gives a local Talos cluster with no Docker daemon in the stack, while keeping nodes lightweight (container mode) rather than full VMs.
 
-## Design constraints (upstream-shaped from day one)
+That is the niche: **no Docker *and* lightweight.** The `docker` provisioner is lightweight but needs a Docker daemon; the `qemu` provisioner needs no Docker but boots full VMs. apple/container fills the remaining quadrant.
 
-- **Go**, implementing the provisioner interface from `siderolabs/talos/pkg/provision` — upstreaming should be a directory move, not a rewrite.
+## What it is (and isn't)
+
+- **Is:** a no-Docker, per-node-kernel, Apple-Silicon-native substrate for *ephemeral local dev and CI* — the same scope Talos officially assigns its `docker` provisioner ("CI pipelines and local testing… not suitable for production deployments").
+- **Isn't:** a production substrate or an upstream path. Talos runs here in *container mode*, so disk-install, in-place upgrade, and reboot don't apply, and a cluster doesn't survive a host restart (recreate ≈ 4 min). For full-lifecycle local Talos, use the supported `qemu` provisioner.
+- **One concrete edge over `docker` on Mac:** Talos's docs note VIPs aren't supported under docker on macOS; here a MetalLB L2 LoadBalancer VIP is **host-reachable** — the provider's vmnet path forwards the gratuitous ARP that the qemu path drops ([#12834](https://github.com/siderolabs/talos/issues/12834)). L7 ingress works via Gateway API / Envoy Gateway.
+
+## Design constraints
+
+- **Go**, implementing the provisioner interface from `siderolabs/talos/pkg/provision` — the integration is a directory move, not a rewrite (verified: builds against the real interface).
 - Exec the `container` CLI; no Swift, no private APIs.
 - No new configuration surface beyond what the docker/qemu provisioners already expose.
 
-## Risks to validate before writing any provisioner code
+## What the spike validated
 
-| Risk | Question to answer |
+| Question | Finding |
 |---|---|
-| Kernel feature set | Does apple/container's Kata-derived default kernel carry what kubelet/CNI need (overlayfs, br_netfilter, nf_conntrack, …)? Containerization supports custom kernels if not. |
-| Init model | Talos `machined` expects to be PID 1; in an apple/container VM, PID 1 is `vminitd`. Does `machined` tolerate running as a child process? |
-| Networking | Stable per-node IPs and node-to-node reachability on the vmnet-backed container network (macOS 26+). |
+| Kernel feature set | apple/container's Kata-derived kernel (6.18.15) carries the kubelet/CNI features built-in; CNI and coredns work once `/opt` is kept off tmpfs (tmpfs would shadow the shipped `/opt/cni/bin`). |
+| Init model | `machined` tolerates running under Apple's `vminitd` (PID 1) given `--cap-add ALL` — the `Privileged: true` equivalent the docker provisioner sets. |
+| Networking | Per-node DHCP IPs (no static-IP option), node-to-node reachable. The provider reconciles the DHCP address *after* boot. MetalLB VIP host-reachable; L7 via Gateway API / Envoy Gateway. |
+
+The DHCP reconciliation — launch the node bare, read its assigned IP with `container inspect`, patch `cluster.controlPlane.endpoint`, then apply the config over the maintenance API — is the design crux, and is why a native provider works where a Docker-API shim cannot. See [`docs/ADR/0001-native-provider-vs-docker-shim.md`](docs/ADR/0001-native-provider-vs-docker-shim.md).
 
 ## Requirements
 

@@ -205,6 +205,10 @@ observed. Empty-but-claimed verification is the exact failure this spike is buil
   ephemeral dev. A provider Reflect IP-refresh would NOT help (the restarted node is blank regardless);
   true cross-restart survival needs persistent `--volume` for /var+/system/state AND an upstream
   static-IP/DHCP-reservation in apple/container. Out of scope for the spike; documented as a known limit.
+- **Update 2026-06-26:** the persistent-`--volume` half of that fix is now **implemented in code**
+  (`feat/persistent-state-volumes`); see the G5 cross-restart entry below for the recipe and the
+  sub-gates (G5a–G5d) that remain UNVERIFIED on hardware. The DHCP/IP half is still unsolved, so
+  this entry's verdict — a single-control-plane cluster is lost on cold restart — still stands.
 
 ## 2026-06-13 — G5/usability: real workload + repo hardening ✅ (Claude-run, pending final acceptance)
 - **Ran:** out-of-box `talosctl cluster create apple-container --name demo` (default image/k8s/2GiB,
@@ -268,6 +272,60 @@ observed. Empty-but-claimed verification is the exact failure this spike is buil
 - **Verdict:** apple/container runs full L7 ingress end-to-end, host-reachable, via BOTH the legacy
   ingress-nginx and the modern Gateway API. The WS0 ingress question is closed; a strong upstream story.
   **Finding for WS0:** its plan still says "ingress-nginx" — that's retired; use Gateway API (verified here).
+
+## 2026-06-26 — G5: cross-restart survival — persistent-volume recipe IMPLEMENTED, runtime UNVERIFIED ⚠️
+- **What changed (code, not a runtime observation):** the provider no longer tmpfs-mounts the two
+  state-bearing paths. `/var` (etcd data) and `/system/state` (machine config + PKI) are now
+  persistent host bind-mounts — `--volume <stateBase>/<cluster>/<node>/var:/var` and
+  `…/system-state:/system/state`, host dirs under the cluster's existing state directory
+  (`_out/clusters/<cluster>/<node>/…` by default; the same $HOME-friendly base Apple's container
+  virtio-fs sharing allows). `Create` mkdir's them and refuses to boot onto a non-empty (stale) `/var`
+  (telling the operator to `destroy` first); `Destroy` `os.RemoveAll`s them so a same-named recreate
+  starts clean. Recipe + tests are green (`go build/vet/test`, `gofmt`); the runtime claims below are
+  NOT yet observed.
+- **Why this is necessary-but-NOT-sufficient (read this before reading the commit as "restart works"):**
+  the cold-restart loss had **two coupled causes** — tmpfs (state in RAM, wiped) AND vmnet DHCP (IP
+  moves, no reservation). This change removes only the first. A restarted control-plane now keeps its
+  config + etcd data, but its IP still changes, so the apiserver/etcd serving certs (SANs pinned to the
+  old IP) go stale. **Restart survival is still expected to FAIL** on the cert mismatch (G5c). Do not
+  read this commit as "restart now works."
+- **UNVERIFIED sub-gates — each needs hands-on testing on real macOS 26 + Apple Silicon hardware:**
+
+  - **G5a — does etcd actually start on a virtio-fs-backed `/var`?** (highest risk: ownership / uid-gid /
+    permission mapping across the virtio-fs share). Likely failure mode: etcd refuses a data dir it does
+    not own, or the host-side dir is owned by the wrong uid.
+    ```sh
+    aegis -name g5 -workers 0 && export TALOSCONFIG=_out/clusters/g5/talosconfig
+    talosctl bootstrap && talosctl health
+    talosctl -n <cp-ip> logs etcd 2>&1 | grep -iE 'permission|chown|uid|gid|data-dir'   # EXPECT: clean
+    ls -lan _out/clusters/g5/g5-controlplane-1/var/lib/etcd                              # who owns the host side?
+    ```
+  - **G5b — does `mount(MS_SHARED|MS_REC)` succeed on a virtio-fs bind-mount?** `setupSharedFilesystems`
+    sets shared propagation on `/var`; it worked on the tmpfs we replaced — virtio-fs may reject it
+    (the original tmpfs fix existed precisely because non-mountpoints returned EINVAL here).
+    ```sh
+    container logs g5-controlplane-1 2>&1 | grep -iE 'setupSharedFilesystems|MS_SHARED|invalid argument'  # EXPECT: empty
+    ```
+  - **G5c — persistent state + IP change on cold restart: EXPECTED to still fail on cert SAN mismatch.**
+    State now survives; the moved IP does not. This documents the remaining coupled cause.
+    ```sh
+    container stop g5-controlplane-1 && container start g5-controlplane-1
+    NEW=$(container inspect g5-controlplane-1 | jq -r '.[0].status.networks[0].ipv4Address' | cut -d/ -f1)
+    talosctl -n "$NEW" get machineconfig   # EXPECT: returns config now (state persisted) — the win
+    talosctl -n "$NEW" health              # EXPECT: still FAILS — x509 cert SAN does not cover $NEW
+    ```
+  - **G5d — fsync durability / performance of etcd on virtio-fs vs the old tmpfs.** tmpfs fsync is a
+    no-op (RAM); virtio-fs round-trips to the host FS, so etcd's `wal_fsync` latency and durability
+    semantics change — measure before trusting it for anything but ephemeral dev.
+    ```sh
+    talosctl -n <cp-ip> etcd status                                 # leader/db-size sane?
+    # etcd wal_fsync_duration_seconds (p99) on virtio-fs vs a tmpfs control run — compare, expect higher.
+    ```
+- **Verdict:** recipe IMPLEMENTED and unit-locked; **all four runtime sub-gates UNVERIFIED.** This is a
+  SPIKE repo — runtime behavior cannot be confirmed here. The next hands-on session runs G5a–G5d on real
+  hardware and records the observations as their own first-person entries.
+
+---
 
 Fill each first-person as the gate runs. Surprises and dead-ends are the most valuable
 entries — they are what a reviewer reads as a human having actually done the work.

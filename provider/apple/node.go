@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"net/netip"
+	"path/filepath"
 	"time"
 
 	"github.com/siderolabs/talos/pkg/machinery/constants"
@@ -15,13 +16,14 @@ import (
 )
 
 // nodeTmpfsPaths returns the in-VM paths that must be independent, writable mounts for a
-// Talos node to boot in container mode.
+// Talos node to boot in container mode — and that are genuinely ephemeral (Talos repopulates
+// them every boot, so RAM-backed tmpfs is correct).
 //
-// Derivation from the docker provider's mount set, with the two apple/container deltas the
+// Derivation from the docker provider's mount set, with the apple/container deltas the
 // G1-G4 spike established (see docs/runbook.md G2/G4):
 //   - docker tmpfs-es /run,/system,/tmp and mounts /var, /system/state, and constants.Overlays
-//     as named *volumes*. apple/container has no docker-style named volumes, so every one of
-//     these becomes a --tmpfs. That is fine: they are runtime dirs Talos repopulates, and making
+//     as named *volumes*. apple/container has no docker-style named volumes, so the ephemeral
+//     ones become a --tmpfs. That is fine: they are runtime dirs Talos repopulates, and making
 //     them real mount points is exactly what Talos's setupSharedFilesystems (MS_SHARED|MS_REC on
 //     /,/var,/etc/cni,/run) requires — without them the boot sequence fails with EINVAL (G2/G4).
 //   - /opt is EXCLUDED. A fresh docker *volume* copies up the image's content, so docker's /opt
@@ -30,8 +32,15 @@ import (
 //     ("failed to find plugin flannel/loopback in /opt/cni/bin"), leaving coredns stuck (G4).
 //     apple/container's rootfs is writable, so leaving /opt unmounted preserves the binaries and
 //     still lets flannel's install-cni write into /opt/cni/bin.
+//   - /var (constants.EphemeralMountPoint) and /system/state (constants.StateMountPoint) are NO
+//     LONGER tmpfs. They are the only two mounts carrying state that must survive a container cold
+//     restart (machine config + PKI live in /system/state; etcd data lives in /var), so they are
+//     now persistent host bind-mounts via nodeVolumePaths / buildRunArgs (--volume). Keeping them
+//     on RAM-backed tmpfs is what wiped a single-control-plane cluster on a daemon restart (the G5
+//     cross-restart gap). NB: this is necessary but not sufficient for restart survival — the
+//     vmnet DHCP IP still moves on restart, so API-server/etcd cert SANs go stale (see G5c).
 func nodeTmpfsPaths() []string {
-	paths := []string{"/run", "/system", "/tmp", constants.EphemeralMountPoint, constants.StateMountPoint}
+	paths := []string{"/run", "/system", "/tmp"}
 
 	for _, overlay := range constants.Overlays {
 		if overlay.Path == "/opt" {
@@ -42,6 +51,32 @@ func nodeTmpfsPaths() []string {
 	}
 
 	return paths
+}
+
+// clusterStatePath is the per-cluster state directory the provisioner persists into:
+// <StateDirectory>/<clusterName>. It is the same value provision.ReadState reconstructs and that
+// State.StatePath() returns, so create and destroy (including a fresh-process Destroy via Reflect)
+// agree on one base without any extra persisted field. provision.NewState writes state.yaml here.
+func clusterStatePath(clusterReq provision.ClusterRequest) string {
+	return filepath.Join(clusterReq.StateDirectory, clusterReq.Name)
+}
+
+// nodeVolumePaths returns the two host directories bind-mounted into a node for the state-bearing
+// in-VM paths: /var (etcd data) and /system/state (machine config + PKI). They live under the
+// cluster's own state directory, so they share the same $HOME-friendly base the provisioner
+// already uses for state.yaml — the location Apple's container virtio-fs sharing allows.
+//
+// Scheme: <statePath>/<nodeName>/var and <statePath>/<nodeName>/system-state, i.e.
+// <StateDirectory>/<clusterName>/<nodeName>/{var,system-state}. The host dir uses "system-state"
+// (a path component cannot contain the in-VM "/system/state").
+//
+// This is the single source of truth: createNode (mount), Create (mkdir + stale-state guard), and
+// Destroy (cleanup) all derive paths here, so the destroy path can never target a different — or
+// empty — directory than the one create populated.
+func nodeVolumePaths(statePath, nodeName string) (varDir, systemStateDir string) {
+	base := filepath.Join(statePath, nodeName)
+
+	return filepath.Join(base, "var"), filepath.Join(base, "system-state")
 }
 
 // buildRunArgs assembles the `container run` argument vector for one node from the verified
@@ -70,6 +105,16 @@ func buildRunArgs(clusterReq provision.ClusterRequest, nodeReq provision.NodeReq
 	for _, path := range nodeTmpfsPaths() {
 		args = append(args, "--tmpfs", path)
 	}
+
+	// Persistent state. /var (etcd) and /system/state (machine config + PKI) are bind-mounted from
+	// per-cluster, per-node host directories so cluster state survives a container cold restart —
+	// they used to be tmpfs (RAM), which wiped the cluster on a daemon/host restart (G5). The host
+	// dirs are created (and stale-state-guarded) in Create before launch; Destroy removes them.
+	varDir, systemStateDir := nodeVolumePaths(clusterStatePath(clusterReq), nodeReq.Name)
+	args = append(args,
+		"--volume", varDir+":"+constants.EphemeralMountPoint,
+		"--volume", systemStateDir+":"+constants.StateMountPoint,
+	)
 
 	// Labels mirror the docker provider (debugging + future Reflect); node IDs are also tracked
 	// in state.yaml so teardown does not depend on label-listing.

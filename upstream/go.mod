@@ -6,6 +6,6 @@
 // standalone. The nested go.mod keeps the parent module's `go build ./...` / tests / lint from
 // trying — and failing — to compile them, while preserving them as real .go files for review and
 // mechanical copy into the talos tree.
-module github.com/BinHsu/aegis-talos-apple-container-provisioner/upstream
+module github.com/BinHsu/aegis-apple-container-provisioner-talos/upstream
 
 go 1.26.4

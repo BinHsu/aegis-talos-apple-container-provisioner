@@ -1,4 +1,4 @@
-module github.com/BinHsu/aegis-talos-apple-container-provisioner
+module github.com/BinHsu/aegis-apple-container-provisioner-talos
 
 go 1.26.4
 

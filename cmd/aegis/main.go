@@ -29,7 +29,7 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/constants"
 	"github.com/siderolabs/talos/pkg/provision"
 
-	"github.com/BinHsu/aegis-talos-apple-container-provisioner/provider/apple"
+	"github.com/BinHsu/aegis-apple-container-provisioner-talos/provider/apple"
 )
 
 const mib = 1024 * 1024

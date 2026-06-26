@@ -22,7 +22,7 @@ That is the niche: **no Docker *and* lightweight.** The `docker` provisioner is 
 
 - **Is:** a no-Docker, per-node-kernel, Apple-Silicon-native substrate for *ephemeral local dev and CI* — the same scope Talos officially assigns its `docker` provisioner ("CI pipelines and local testing… not suitable for production deployments").
 - **Isn't:** a production substrate or an upstream path. Talos runs here in *container mode*, so disk-install, in-place upgrade, and reboot don't apply, and a cluster does not yet survive a host cold restart (recreate ≈ 4 min). For full-lifecycle local Talos, use the supported `qemu` provisioner.
-  - **Restart survival, in progress (honest status):** node `/var` (etcd) and `/system/state` (machine config + PKI) are now **persistent host bind-mounts**, not RAM-backed tmpfs, so that state is no longer wiped on a cold restart. This is **necessary but not sufficient** — the vmnet DHCP IP still changes on restart, so the apiserver/etcd serving-cert SANs go stale and a single-control-plane cluster still does not come back healthy. Restart survival also needs an upstream static-IP / DHCP-reservation in `container`. The persistent-volume recipe is implemented in code; its on-hardware behavior (etcd on virtio-fs, mount propagation, fsync) is **unverified** — see G5a–G5d in [`docs/VERIFICATION.md`](docs/VERIFICATION.md). Do not rely on restart working.
+  - **Restart survival (hardware-verified 2026-06-26):** named volumes for `/var` (etcd) and `/system/state` (PKI + machineconfig) are hardware-verified (G5a–G5c); etcd data survives cold restart. When `-dns-domain` is set, the `kubectl`/kubeconfig path fully recovers with zero reconfiguration — the FQDN endpoint stays valid as the DNS forwarder tracks the new DHCP IP (G6b). The `talosctl -n` side still requires the current IP after restart (`talosctl`'s `--nodes` flag does not accept hostnames). See G5 and G6b in [`docs/VERIFICATION.md`](docs/VERIFICATION.md).
 - **One concrete edge over `docker` on Mac:** Talos's docs note VIPs aren't supported under docker on macOS; here a MetalLB L2 LoadBalancer VIP is **host-reachable** — the provider's vmnet path forwards the gratuitous ARP that the qemu path drops ([#12834](https://github.com/siderolabs/talos/issues/12834)). L7 ingress works via Gateway API / Envoy Gateway.
 
 ## Design constraints
@@ -71,9 +71,12 @@ across container restarts — no manual update needed when the DHCP IP shifts.
 aegis -dns-domain ""
 ```
 
-**Verification status:** host-to-container DNS and automatic IP-update after restart are verified
-(busybox, 2026-06-26). Full Talos cold-restart survival via FQDN endpoint is still unverified on
-hardware — see G6b in [`docs/VERIFICATION.md`](docs/VERIFICATION.md).
+**Verification status (2026-06-26):** host-to-container DNS and automatic IP-update after restart
+(busybox, G6a) and full Talos cold-restart endpoint survival (G6b) are both **hardware-verified**.
+Cold-restart resilience applies to the `kubectl`/kubeconfig path: the node returns Ready and etcd
+data persists without any reconfiguration. The `talosctl -n` path still requires the current IP
+after restart — `talosctl`'s `--nodes` flag does not accept hostnames; pass `-n <current-IP>` for
+node targeting. See G6 in [`docs/VERIFICATION.md`](docs/VERIFICATION.md).
 
 ## Requirements
 

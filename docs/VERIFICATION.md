@@ -333,13 +333,25 @@ observed. Empty-but-claimed verification is the exact failure this spike is buil
     talosctl -n "$NEW" get machineconfig   # EXPECT: returns config now (state persisted on the volume) — the win
     talosctl -n "$NEW" health              # EXPECT: still FAILS — x509 cert SAN does not cover $NEW
     ```
-- **Known gap — `aegis -destroy` cannot clean a FAILED create.** Destroy reflects recorded state
-  (`Reflect` / `state.yaml`), so it can only tear down a cluster whose Create reached `saveState`. When a
-  Create FAILED before that (observed: a stuck container left behind), there is no `state.yaml` for
-  Destroy to act on and the leftover container had to be removed by hand. The fix is a **label-based
-  sweep**: every node already carries `--label talos.owned=true` (+ `talos.cluster.name`), so Destroy
-  should also list-and-remove containers/volumes by that label to clean half-created clusters. Tracked,
-  not yet implemented.
+- **FIXED — `aegis -destroy` now cleans a FAILED create (label sweep).** Previously Destroy reflected
+  recorded state only (`Reflect` / `state.yaml`), so it could tear down only a cluster whose Create
+  reached `saveState`; a Create that FAILED before that (observed: a stuck container, and now named
+  volumes, left behind) had no `state.yaml` and the leftovers had to be removed by hand. Now:
+  - **Create stamps the cluster labels on volumes too.** Containers already carried
+    `--label talos.owned=true` + `talos.cluster.name=<name>` (buildRunArgs); `volumeCreate` now stamps the
+    same `talos.cluster.name`/`talos.owned` labels on each `/var` and `/system/state` named volume.
+  - **Destroy runs a label sweep in addition to the recorded-node pass.** Keyed on
+    `talos.cluster.name=<name>`, it lists every matching container (stop + rm) and volume (delete), all
+    idempotent. The sweep runs even when the recorded node list is empty/missing, so it reclaims
+    orphaned containers AND volumes from a half-created cluster. The `container` CLI has **no native
+    `--label`/`--filter`** on `list` or `volume list` (verified from `--help`), so the sweep lists
+    `--format json` and matches labels client-side (`listContainersByLabel` / `listVolumesByLabel`).
+  - **`-destroy` tolerates a missing `state.yaml`.** `cmd/aegis` no longer aborts when `Reflect` fails
+    with `fs.ErrNotExist`; it falls back to a label-based Destroy keyed on `-name` + `-state-dir`
+    (`apple.ClusterRef`). So `aegis -name X -destroy` cleans a half-created cluster X. Other `Reflect`
+    errors (corrupt/unparseable state) still surface. Unit-locked in `provider_test.go`
+    (selector string, volume-label/selector symmetry, the client-side JSON filter, and the missing-state
+    ref). Live container behavior remains to be confirmed on hardware in the next hands-on session.
 - **Verdict:** host-bind approach VERIFIED-FAILED and abandoned; named-volume recipe IMPLEMENTED and
   unit-locked; the chmod wall is proven cleared by the busybox A/B test, but the full Talos boot
   (G5a) and cross-restart behavior (G5c) remain UNVERIFIED. This is a SPIKE repo — runtime behavior

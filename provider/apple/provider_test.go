@@ -297,3 +297,137 @@ func TestPrepareNodeVolumes_StaleStateGuard(t *testing.T) {
 		}
 	})
 }
+
+// TestClusterLabelSelector locks the exact selector string the destroy sweep builds. The literal
+// "talos.cluster.name=<name>" is load-bearing: it must match the --label buildRunArgs stamps on
+// containers and the labels volumeCreate stamps on volumes, or the sweep finds nothing.
+func TestClusterLabelSelector(t *testing.T) {
+	if got, want := clusterLabelSelector("aegis"), "talos.cluster.name=aegis"; got != want {
+		t.Errorf("selector: got %q, want %q", got, want)
+	}
+
+	// The container label buildRunArgs writes must equal the selector, or the sweep can't find them.
+	args := buildRunArgs(provision.ClusterRequest{Name: "aegis"}, workerReq("aegis-worker-1"))
+	if !hasPair(args, "--label", clusterLabelSelector("aegis")) {
+		t.Errorf("container is not labeled with the destroy selector %q; sweep would miss it\nargs: %s",
+			clusterLabelSelector("aegis"), strings.Join(args, " "))
+	}
+}
+
+// TestVolumeLabels_MatchSelector proves volume creation labels line up with the destroy selector:
+// volumeLabels(name)[0] must equal clusterLabelSelector(name), so a volume the sweep is looking for is
+// exactly the one create stamped. Also checks the owned marker is present.
+func TestVolumeLabels_MatchSelector(t *testing.T) {
+	labels := volumeLabels("aegis")
+
+	if len(labels) == 0 || labels[0] != clusterLabelSelector("aegis") {
+		t.Errorf("volumeLabels[0]=%v must equal selector %q", labels, clusterLabelSelector("aegis"))
+	}
+
+	if !slices.Contains(labels, "talos.owned=true") {
+		t.Errorf("volume must carry talos.owned=true, got %v", labels)
+	}
+}
+
+// TestVolumeCreateArgs asserts the `volume create` vector carries each label behind its own --label
+// flag and keeps <name> as the trailing positional argument (a name in the wrong position would make
+// the CLI treat a label as the name). The no-label case must still produce a valid command.
+func TestVolumeCreateArgs(t *testing.T) {
+	args := volumeCreateArgs("aegis-w1-var", "talos.cluster.name=aegis", "talos.owned=true")
+
+	if !hasPair(args, "--label", "talos.cluster.name=aegis") || !hasPair(args, "--label", "talos.owned=true") {
+		t.Errorf("both labels must appear behind --label: %v", args)
+	}
+
+	if args[0] != "volume" || args[1] != "create" {
+		t.Errorf("command must start with `volume create`: %v", args)
+	}
+
+	if args[len(args)-1] != "aegis-w1-var" {
+		t.Errorf("volume name must be the trailing positional arg: %v", args)
+	}
+
+	// Boundary: zero labels still yields a valid `volume create <name>`.
+	if bare := volumeCreateArgs("v0"); len(bare) != 3 || bare[2] != "v0" {
+		t.Errorf("no-label create must be `volume create v0`: %v", bare)
+	}
+}
+
+// TestContainersMatchingLabel exercises the client-side label filter (the CLI has no native filter).
+// The sample JSON mirrors the real `container list --all --format json` schema. Cases: exact match
+// (included), same key with a different value (excluded), label absent (excluded), and an empty list.
+func TestContainersMatchingLabel(t *testing.T) {
+	const sample = `[
+	  {"configuration":{"id":"aegis-cp-1","labels":{"talos.cluster.name":"aegis","talos.owned":"true"}}},
+	  {"configuration":{"id":"other-cp-1","labels":{"talos.cluster.name":"other","talos.owned":"true"}}},
+	  {"configuration":{"id":"unlabeled","labels":{}}}
+	]`
+
+	got, err := containersMatchingLabel(sample, clusterLabelSelector("aegis"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if want := []string{"aegis-cp-1"}; !slices.Equal(got, want) {
+		t.Errorf("got %v, want %v (must include only the aegis-labeled container)", got, want)
+	}
+
+	empty, err := containersMatchingLabel(`[]`, clusterLabelSelector("aegis"))
+	if err != nil {
+		t.Fatalf("empty list must not error: %v", err)
+	}
+
+	if len(empty) != 0 {
+		t.Errorf("empty list must yield no matches, got %v", empty)
+	}
+
+	if _, err := containersMatchingLabel(sample, "no-equals-sign"); err == nil {
+		t.Error("a selector without '=' must be rejected")
+	}
+}
+
+// TestVolumesMatchingLabel mirrors TestContainersMatchingLabel for the volume schema, where the match
+// returns `.configuration.name` rather than `.configuration.id`.
+func TestVolumesMatchingLabel(t *testing.T) {
+	const sample = `[
+	  {"configuration":{"name":"aegis-w1-var","labels":{"talos.cluster.name":"aegis","talos.owned":"true"}}},
+	  {"configuration":{"name":"aegis-w1-system-state","labels":{"talos.cluster.name":"aegis"}}},
+	  {"configuration":{"name":"other-var","labels":{"talos.cluster.name":"other"}}},
+	  {"configuration":{"name":"legacy-unlabeled","labels":{}}}
+	]`
+
+	got, err := volumesMatchingLabel(sample, clusterLabelSelector("aegis"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	want := []string{"aegis-w1-var", "aegis-w1-system-state"}
+	if !slices.Equal(got, want) {
+		t.Errorf("got %v, want %v (only aegis-labeled volumes)", got, want)
+	}
+}
+
+// TestClusterRef_CarriesNameForSweep proves the missing-state fallback (cmd/aegis) hands Destroy a
+// Cluster whose ClusterName drives the label sweep and whose StatePath is the per-cluster dir, with an
+// empty node list (there is no recorded state when Create failed before saveState).
+func TestClusterRef_CarriesNameForSweep(t *testing.T) {
+	c := ClusterRef("aegis", "_out/clusters/aegis")
+
+	if c.Info().ClusterName != "aegis" {
+		t.Errorf("ClusterName: got %q, want %q", c.Info().ClusterName, "aegis")
+	}
+
+	if len(c.Info().Nodes) != 0 {
+		t.Errorf("missing-state ref must have no recorded nodes, got %d", len(c.Info().Nodes))
+	}
+
+	sp, err := c.StatePath()
+	if err != nil || sp != "_out/clusters/aegis" {
+		t.Errorf("StatePath: got %q, err %v", sp, err)
+	}
+
+	// The sweep selector derived from this ref must equal what create stamps.
+	if clusterLabelSelector(c.Info().ClusterName) != "talos.cluster.name=aegis" {
+		t.Errorf("ref-derived selector drifted: %q", clusterLabelSelector(c.Info().ClusterName))
+	}
+}

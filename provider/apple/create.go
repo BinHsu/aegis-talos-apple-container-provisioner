@@ -54,8 +54,14 @@ func (p *provisioner) Create(ctx context.Context, request provision.ClusterReque
 	orderedReqs := slices.Concat(request.Nodes.ControlPlaneNodes(), request.Nodes.WorkerNodes())
 
 	// Persistent-state volumes: create each node's /var and /system/state named volumes before launch,
-	// and refuse to boot onto stale state from a prior run (see prepareNodeVolumes).
-	if err = prepareNodeVolumes(ctx, request.Name, orderedReqs, p.volumeExists, p.volumeCreate); err != nil {
+	// and refuse to boot onto stale state from a prior run (see prepareNodeVolumes). Volumes are stamped
+	// with the cluster labels so the destroy label sweep can reclaim them even if this Create fails
+	// before saveState (the half-created-cluster gap, docs/VERIFICATION.md G5).
+	createVolume := func(ctx context.Context, name string) error {
+		return p.volumeCreate(ctx, name, volumeLabels(request.Name)...)
+	}
+
+	if err = prepareNodeVolumes(ctx, request.Name, orderedReqs, p.volumeExists, createVolume); err != nil {
 		return nil, err
 	}
 

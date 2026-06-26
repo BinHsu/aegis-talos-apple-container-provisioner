@@ -15,8 +15,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"log"
 	"net/netip"
 	"path/filepath"
@@ -68,7 +70,17 @@ func run() error {
 	if *destroy {
 		cluster, err := prov.Reflect(ctx, *clusterName, *stateDir)
 		if err != nil {
-			return fmt.Errorf("reflecting cluster %q: %w", *clusterName, err)
+			// A Create that failed before saveState leaves no state.yaml (and may leave a stuck
+			// container + named volumes). Don't abort: fall back to a label-based Destroy keyed on the
+			// cluster name so half-created clusters can still be cleaned. Other Reflect errors (corrupt
+			// state, parse failure) still surface.
+			if !errors.Is(err, fs.ErrNotExist) {
+				return fmt.Errorf("reflecting cluster %q: %w", *clusterName, err)
+			}
+
+			statePath := filepath.Join(*stateDir, *clusterName)
+			fmt.Printf("no state.yaml for cluster %q; sweeping by label %s\n", *clusterName, "talos.cluster.name="+*clusterName)
+			cluster = apple.ClusterRef(*clusterName, statePath)
 		}
 
 		if err = prov.Destroy(ctx, cluster); err != nil {

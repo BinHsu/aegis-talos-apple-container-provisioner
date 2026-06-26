@@ -32,3 +32,14 @@ func (res *result) StatePath() (string, error) {
 
 	return res.statePath, nil
 }
+
+// ClusterRef builds a minimal provision.Cluster carrying only the cluster name and state path. It
+// exists for the destroy path when state.yaml is absent — a Create that failed before saveState leaves
+// orphaned containers/volumes but no recorded node list. Info().Nodes is empty, so Destroy relies
+// entirely on its label sweep (keyed on ClusterName) to reclaim those resources, then removes statePath.
+func ClusterRef(clusterName, statePath string) provision.Cluster {
+	return &result{
+		clusterInfo: provision.ClusterInfo{ClusterName: clusterName},
+		statePath:   statePath,
+	}
+}

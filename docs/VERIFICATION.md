@@ -205,6 +205,12 @@ observed. Empty-but-claimed verification is the exact failure this spike is buil
   ephemeral dev. A provider Reflect IP-refresh would NOT help (the restarted node is blank regardless);
   true cross-restart survival needs persistent `--volume` for /var+/system/state AND an upstream
   static-IP/DHCP-reservation in apple/container. Out of scope for the spike; documented as a known limit.
+- **Update 2026-06-26:** the persistent-`--volume` half of that fix is **implemented and
+  hardware-verified** (`feat/persistent-state-volumes`); sub-gates G5a/G5b/G5c all PASS — see the
+  G5 cross-restart entry below. The DHCP/IP half is still unsolved, but Talos self-heals node certs
+  on the new IP; the only residual breakage is the kubeconfig endpoint staying pinned to the old IP
+  (re-point required; not a cert-SAN dead end). Revised verdict: state persists across cold restart;
+  the cluster is recoverable without recreation.
 
 ## 2026-06-13 — G5/usability: real workload + repo hardening ✅ (Claude-run, pending final acceptance)
 - **Ran:** out-of-box `talosctl cluster create apple-container --name demo` (default image/k8s/2GiB,
@@ -268,6 +274,120 @@ observed. Empty-but-claimed verification is the exact failure this spike is buil
 - **Verdict:** apple/container runs full L7 ingress end-to-end, host-reachable, via BOTH the legacy
   ingress-nginx and the modern Gateway API. The WS0 ingress question is closed; a strong upstream story.
   **Finding for WS0:** its plan still says "ingress-nginx" — that's retired; use Gateway API (verified here).
+
+## 2026-06-26 — G5: named-volume persistence — all sub-gates HARDWARE-VERIFIED ✅
+
+**Environment:** macOS Apple Silicon · `container` CLI 1.0.0 · talos v1.13.3 · 1 control-plane /
+0 workers / 3072 MB · persistent state on Apple `container` named volumes.
+
+### G5b — Talos boot on named volume (MS_SHARED mounts) ✅ PASS
+
+- **Ran:** `aegis create` with `/var` and `/system/state` as named volumes; watched the
+  control-plane console from first boot through maintenance.
+- **Saw:** `phase sharedFilesystems ... done` · `task mountEphemeralPartition ... done` ·
+  `phase startEverything`; zero `chmod` / `MountController` errors; `:50000` OPEN; `aegis create`
+  exited 0.
+- **Verdict:** the chmod wall is cleared end-to-end. Named volumes give the guest real block
+  ownership, so Talos's `block.MountController` succeeds where the host-bind approach looped forever.
+
+### G5a — etcd on named-volume `/var` ✅ PASS
+
+- **Ran:** `talosctl bootstrap` after `aegis create` exit 0; then `talosctl service etcd` ·
+  `talosctl etcd members` · `talosctl health` · `kubectl get nodes`.
+- **Saw:** `talosctl service etcd` → STATE Running / HEALTH OK; 1 etcd member; no permission or
+  ownership errors in etcd logs; `talosctl health` all checks OK; `kubectl get nodes` →
+  control-plane Ready, Kubernetes v1.36.1, containerd://2.2.4.
+- **Verdict:** etcd runs cleanly on the ext4-backed named volume. Both state-bearing mounts
+  (`/var` for etcd data, `/system/state` for PKI + machineconfig) are fully functional.
+
+### G5c — cold-restart persistence ✅ PASS (characterized limitation: DHCP IP shift)
+
+- **Ran:** seeded namespace `g5c-marker`; `container stop g5-controlplane-1` →
+  `container start g5-controlplane-1`; re-queried etcd state and cluster objects at the new IP.
+- **Saw:** IP moved `192.168.64.5 → 192.168.64.6` (vmnet DHCP, no reservation — expected). Despite
+  the IP change: etcd returned with the **same member id `d59b486478f5e7d4`**, HEALTH OK; the
+  `g5c-marker` namespace was still present (Active), read over **validated TLS** at the new IP.
+  Contrast: the prior tmpfs approach wiped all state on restart — blank node, blank etcd.
+- **Characterized limitation (necessary-not-sufficient, but narrower than feared):** IP changes on
+  cold restart. Talos **self-heals** node certs — both `apid` (`:50000`) and `kube-apiserver`
+  (`:6443`) are reachable on the new IP under validated TLS. The **only** residual breakage: the
+  control-plane endpoint and generated kubeconfig stay pinned to the old IP; the old kubeconfig
+  fails with `dial tcp 192.168.64.5:6443: i/o timeout`. Recovery requires re-pointing the endpoint
+  to the new IP. This is **not** a cert-SAN dead end.
+- **Verdict:** named volumes resolve the state-loss problem. The remaining IP-shift gap is
+  operational, not structural — substantially narrower than the prior assessment ("cluster lost on
+  cold restart, must recreate").
+
+---
+
+### Dead-end documented: host-path bind-mount
+
+**VERIFIED FAIL.** The original implementation bind-mounted host dirs
+(`--volume <hostpath>:/var`, `--volume <hostpath>:/system/state`). On real hardware the
+control-plane node never reached maintenance mode. Apple's `--volume <hostpath>:<container>` is a
+**virtio-fs host share**: the guest has no real ownership, so in-guest `chmod` returns "operation
+not permitted". Talos's `block.MountController` unconditionally chmods `/system/state`, so it
+looped forever:
+
+```
+failed to chmod "/system/state": chmod /system/state: operation not permitted
+```
+
+Consequence chain: mount controller never settles → maintenance API (`:50000`) never opens →
+`aegis create apply-config` fails with `dial tcp <ip>:50000: connect: connection refused`.
+Host-bind is a dead end for any Talos path that chmods its mounts — which `/system/state` always
+does.
+
+**Why named volumes work.** `container volume list --format json` shows named volumes carry
+`"format": "ext4"` and
+`"source": "~/Library/Application Support/com.apple.container/volumes/<name>/volume.img"` — a
+block-backed ext4 image (default 512 GiB sparse), owned by guest root. In-guest chmod succeeds
+because the guest owns the block device, not a virtio-fs mount it cannot modify. Corroborating
+busybox A/B test (same image, two mount types, unambiguous): chmod on a named volume →
+`NAMED_OK`; chmod on a host bind-mount → `HOST_FAIL` / "Operation not permitted".
+
+---
+
+### Follow-up (open): endpoint-refresh command
+
+G5c confirms that named volumes keep state across cold restart, but the control-plane endpoint and
+generated kubeconfig stay pinned to the pre-restart IP. A sibling to `destroy` — an
+endpoint-refresh command — should read the current container IP and rewrite the control-plane
+endpoint (and re-merge kubeconfig) to restore full connectivity after a DHCP IP change without
+manual intervention. This is the one remaining gap between "state persists" and "cluster is
+immediately operational after cold restart."
+
+### Destroy happy-path ✅ PASS
+
+- **Ran:** `aegis -destroy` with `state.yaml` present on a healthy cluster.
+- **Saw:** container removed, both named volumes removed, state directory removed — clean exit.
+- **Verdict:** recorded-state teardown path is clean on real hardware.
+
+### Label-sweep (failed-create cleanup) ✅ VERIFIED / GAP CLOSED
+
+**Background.** Previously Destroy reflected recorded state only (`Reflect` / `state.yaml`), so a
+Create that failed before `saveState` left orphaned containers and volumes behind. The label-sweep
+implementation was unit-tested but unverified on live hardware until this session.
+
+- **Ran:** labeled a busybox container + named volume with `talos.cluster.name=swtest` /
+  `talos.owned=true` (mimicking a half-created cluster with no `state.yaml`), then
+  `aegis -name swtest -destroy`.
+- **Saw:**
+  ```
+  no state.yaml for cluster "swtest"; sweeping by label talos.cluster.name=swtest
+  sweeping container swtest-node
+  sweeping volume swtest-vol
+  ```
+  Both resources confirmed gone.
+- **JSON schema verified on live output:** container labels at `.configuration.labels`, container id
+  at `.configuration.id`; volume labels at `.configuration.labels`, volume name at
+  `.configuration.name`. The `container` CLI has no native `--label` filter on `list` or
+  `volume list` (confirmed from `--help`); the sweep lists `--format json` and matches labels
+  client-side — the client-side filter logic is correct against the real API response shape.
+- **Verdict:** the orphaned-resource gap is closed on real hardware. A failed `aegis create` no
+  longer requires manual cleanup.
+
+---
 
 Fill each first-person as the gate runs. Surprises and dead-ends are the most valuable
 entries — they are what a reviewer reads as a human having actually done the work.

@@ -8,7 +8,6 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"path/filepath"
 	"slices"
 	"strconv"
 
@@ -35,7 +34,7 @@ func (p *provisioner) Create(ctx context.Context, request provision.ClusterReque
 		}
 	}
 
-	statePath := filepath.Join(request.StateDirectory, request.Name)
+	statePath := clusterStatePath(request)
 
 	fmt.Fprintf(options.LogWriter, "creating state directory in %q\n", statePath)
 
@@ -53,6 +52,18 @@ func (p *provisioner) Create(ctx context.Context, request provision.ClusterReque
 	// Launch order: control-plane first (so the first node is the control plane whose IP becomes
 	// the cluster endpoint), then workers.
 	orderedReqs := slices.Concat(request.Nodes.ControlPlaneNodes(), request.Nodes.WorkerNodes())
+
+	// Persistent-state volumes: create each node's /var and /system/state named volumes before launch,
+	// and refuse to boot onto stale state from a prior run (see prepareNodeVolumes). Volumes are stamped
+	// with the cluster labels so the destroy label sweep can reclaim them even if this Create fails
+	// before saveState (the half-created-cluster gap, docs/VERIFICATION.md G5).
+	createVolume := func(ctx context.Context, name string) error {
+		return p.volumeCreate(ctx, name, volumeLabels(request.Name)...)
+	}
+
+	if err = prepareNodeVolumes(ctx, request.Name, orderedReqs, p.volumeExists, createVolume); err != nil {
+		return nil, err
+	}
 
 	fmt.Fprintln(options.LogWriter, "launching nodes (bare; maintenance mode)")
 
@@ -107,6 +118,51 @@ func validateClusterRequest(request provision.ClusterRequest) error {
 	if len(request.Nodes.ControlPlaneNodes()) == 0 {
 		return fmt.Errorf("cluster %q: at least one control-plane node is required, got %d nodes (%d control-plane)",
 			request.Name, len(request.Nodes), len(request.Nodes.ControlPlaneNodes()))
+	}
+
+	return nil
+}
+
+// prepareNodeVolumes creates each node's persistent /var and /system/state named volumes, and guards
+// against booting onto stale state.
+//
+// The guard is the load-bearing side effect of moving from tmpfs to persistent volumes: a /var volume
+// left behind by a prior run carries old etcd data, and a stale /system/state carries an old machine
+// config + PKI. Reusing either silently would boot a node into a stale, half-broken cluster (wrong
+// certs, divergent etcd) rather than a clean one. So for each volume we refuse if it already EXISTS
+// (telling the operator to destroy this cluster first) and otherwise create it fresh — never silently
+// reuse a stale volume, never silently wipe one.
+//
+// exists/create are injected (p.volumeExists / p.volumeCreate in production) so the guard is unit-testable
+// without the `container` CLI.
+func prepareNodeVolumes(
+	ctx context.Context,
+	clusterName string,
+	reqs []provision.NodeRequest,
+	exists func(context.Context, string) (bool, error),
+	create func(context.Context, string) error,
+) error {
+	for _, req := range reqs {
+		varVol, systemStateVol := nodeVolumeNames(clusterName, req.Name)
+
+		for _, vol := range []string{varVol, systemStateVol} {
+			present, err := exists(ctx, vol)
+			if err != nil {
+				return fmt.Errorf("checking volume %q for node %q: %w", vol, req.Name, err)
+			}
+
+			if present {
+				return fmt.Errorf(
+					"node %q: named volume %q already exists (stale state from a prior run); "+
+						"run destroy for this cluster first — refusing to reuse it",
+					req.Name, vol,
+				)
+			}
+
+			if err := create(ctx, vol); err != nil {
+				return fmt.Errorf("creating volume %q for node %q: %w", vol, req.Name, err)
+			}
+		}
 	}
 
 	return nil
